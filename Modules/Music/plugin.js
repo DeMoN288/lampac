@@ -187,6 +187,7 @@
     };
     var MUSIC_RADIO_STATE = {
         pending: false,
+        request: null,
         lastGeneration: '',
         lastRequestAt: 0
     };
@@ -478,9 +479,9 @@
         }
     }
 
-    function request(url, success, error) {
+    function request(url, success, error, timeoutMs) {
         var network = new Lampa.Reguest();
-        network.timeout(20000);
+        network.timeout(Math.max(1000, Number(timeoutMs || 20000)));
         network.silent(withIdentity(url), success, error || function () {});
     }
 
@@ -1215,6 +1216,7 @@
         name = name || 'content';
 
         setTimeout(function () {
+            if (isStandaloneIosPlayerForeground()) return;
             try {
                 if (Lampa.Controller && Lampa.Controller.toggle)
                     Lampa.Controller.toggle(name);
@@ -1303,12 +1305,14 @@
         if (!context) return;
 
         setTimeout(function () {
+            if (isStandaloneIosPlayerForeground()) return;
             if (Date.now() < MUSIC_HOME_REFRESH_RESTORE_BLOCK_UNTIL && context.container && $(context.container).hasClass('lm-home-line'))
                 return;
 
             restoreController(context.controller || 'content');
 
             setTimeout(function () {
+                if (isStandaloneIosPlayerForeground()) return;
                 var target = findMusicFocusElement(context);
                 if (!target) {
                     var fallbackContainer = context.container && document.documentElement.contains(context.container)
@@ -2057,6 +2061,7 @@
         if (track && getTrackProviderId(track)) parts.push('provider=' + encodeURIComponent(getTrackProviderId(track)));
         if (track && track.title) parts.push('title=' + encodeURIComponent(track.title));
         if (track && track.artist_name) parts.push('artist_name=' + encodeURIComponent(track.artist_name));
+        if (track && track.album_id) parts.push('album_id=' + encodeURIComponent(track.album_id));
         if (track && track.album_title) parts.push('album_title=' + encodeURIComponent(track.album_title));
         if (track && track.isrc) parts.push('isrc=' + encodeURIComponent(track.isrc));
         if (track && (track.duration_ms || track.duration_ms === 0)) parts.push('duration_ms=' + encodeURIComponent(track.duration_ms));
@@ -2101,12 +2106,19 @@
 
         var matchId = track.id ? String(track.id) : '';
         Object.keys(PLAY_PREFETCH_CACHE).forEach(function (key) {
-            if (matchId && key.indexOf('id=' + encodeURIComponent(matchId)) >= 0)
+            if (matchId && ('&' + key + '&').indexOf('&id=' + encodeURIComponent(matchId) + '&') >= 0)
                 delete PLAY_PREFETCH_CACHE[key];
         });
         Object.keys(PLAY_PREFETCH_PENDING).forEach(function (key) {
-            if (matchId && key.indexOf('id=' + encodeURIComponent(matchId)) >= 0)
+            if (matchId && ('&' + key + '&').indexOf('&id=' + encodeURIComponent(matchId) + '&') >= 0) {
+                var callbacks = PLAY_PREFETCH_PENDING[key];
                 delete PLAY_PREFETCH_PENDING[key];
+                setTimeout(function () {
+                    callbacks.forEach(function (cb) {
+                        if (cb.fail) cb.fail(null);
+                    });
+                }, 0);
+            }
         });
     }
 
@@ -2801,6 +2813,12 @@
     }
 
     function emitRecentChanged(sectionKey, payload) {
+        // History is saved during playback; rebuilding shelves must wait until the player yields focus.
+        if (isStandaloneIosPlayerForeground()) {
+            MUSIC_DEFERRED_HOME_REFRESH = true;
+            return;
+        }
+
         if (isLampaPlayerOverlayOpen()) {
             MUSIC_DEFERRED_HOME_REFRESH = true;
             traceEmbeddedIos('recent-event-deferred', sectionKey || '', true);
@@ -2814,6 +2832,25 @@
                 payload: payload || null
             }
         }));
+    }
+
+    function isStandaloneIosPlayerForeground() {
+        return MUSIC_IOS_FULL_PLAYER_OPEN
+            || !!(MUSIC_IOS_BAR && MUSIC_IOS_BAR.hasClass('lm-ios-player--visible')
+                && safeControllerName() === 'lampac_music_player_bar');
+    }
+
+    function flushStandaloneIosDeferredHomeRefresh() {
+        if (!MUSIC_DEFERRED_HOME_REFRESH || isStandaloneIosPlayerForeground() || isLampaPlayerOverlayOpen()) return;
+
+        var controller = safeControllerName();
+        if (controller !== 'content' && controller !== 'items_line') return;
+
+        var active = Lampa.Activity.active();
+        if (!active || active.component !== 'lampac_music_home') return;
+
+        // Controller.toggle restores navigation only; Activity.toggle also consumes the pending home refresh.
+        if (active.activity && typeof active.activity.toggle === 'function') active.activity.toggle();
     }
 
     function isLampaPlayerOverlayOpen() {
@@ -3764,7 +3801,7 @@
     function getActiveMusicQuery() {
         try {
             var active = Lampa.Activity.active();
-            if (!active || active.component !== 'lampac_music_home') return '';
+            if (!active || (active.component !== 'lampac_music_home' && active.component !== 'lampac_music_search')) return '';
             return String(active.query || '').trim();
         } catch (e) {
             return '';
@@ -4382,9 +4419,77 @@
         Lampa.Storage.set(MUSIC.storage.radio_autoplay_enabled, enabled === true);
 
         if (!enabled) {
-            MUSIC_RADIO_STATE.pending = false;
+            resetRadioAutoplayRequest();
             MUSIC_RADIO_STATE.lastGeneration = '';
         }
+    }
+
+    function resetRadioAutoplayRequest() {
+        var request = MUSIC_RADIO_STATE.request;
+        if (request) {
+            ['play', 'seeking', 'error'].forEach(function (type) {
+                request.media.removeEventListener(type, request.onIntent);
+            });
+        }
+        MUSIC_RADIO_STATE.request = null;
+        MUSIC_RADIO_STATE.pending = false;
+    }
+
+    function cancelRadioAutoplayResume() {
+        var request = MUSIC_RADIO_STATE.request;
+        if (request && request.waiting) {
+            request.waiting = null;
+            request.resumeCancelled = true;
+        }
+    }
+
+    function radioQueueIdentity(tracks) {
+        // Snapshot IDs change on saves, even when the playback queue is unchanged.
+        return JSON.stringify((tracks || []).map(function (track) { return track && track.id || ''; }));
+    }
+
+    function isRadioAutoplayRequestCurrent(request) {
+        if (!request || MUSIC_RADIO_STATE.request !== request || !isRadioAutoplayEnabled()
+            || getPlaybackMode() !== 'audio' || getStandaloneIosRepeatMode() === 'all'
+            || request.player !== currentExternalPlayer() || request.launch !== MUSIC_PLAY_LAUNCH_TOKEN
+            || request.queue !== radioQueueIdentity(queueTracks())) return false;
+
+        if (shouldUseStandaloneIosAudio())
+            return isStandaloneIosAudioActive() && request.media === MUSIC_IOS_AUDIO.audio;
+
+        var data = activePlayerData();
+        return !!(data && data.from_music_cluster && request.media === activeMusicMediaElement()
+            && canReuseActiveQueue(queueTracks()));
+    }
+
+    function waitForRadioAutoplay(media) {
+        var request = MUSIC_RADIO_STATE.request;
+        if (!isRadioAutoplayRequestCurrent(request) || request.media !== media
+            || request.resumeCancelled || getStandaloneIosRepeatMode() !== 'off' || media.error) return false;
+
+        var standalone = shouldUseStandaloneIosAudio();
+        var index = queueCurrentIndex();
+        if (index < 0 || (standalone ? standaloneIosNeighborIndex(1) >= 0 : index < queueTracks().length - 1))
+            return false;
+
+        request.waiting = {
+            index: index,
+            time: Number(media.currentTime || 0),
+            source: media.currentSrc || media.src,
+            switchToken: standalone ? MUSIC_IOS_AUDIO.playWatchToken : MUSIC_EMBEDDED_IOS.switchToken
+        };
+        return true;
+    }
+
+    function canResumeRadioAutoplay(request) {
+        var waiting = request.waiting;
+        var media = request.media;
+        var switchToken = shouldUseStandaloneIosAudio() ? MUSIC_IOS_AUDIO.playWatchToken : MUSIC_EMBEDDED_IOS.switchToken;
+        return !!(waiting && getStandaloneIosRepeatMode() === 'off' && !media.error
+            && (media.paused || media.ended) && queueCurrentIndex() === waiting.index
+            && (!shouldUseStandaloneIosAudio() || standaloneIosNeighborIndex(1) < 0)
+            && switchToken === waiting.switchToken && (media.currentSrc || media.src) === waiting.source
+            && Math.abs(Number(media.currentTime || 0) - waiting.time) < 0.5);
     }
 
     function normalizeRadioDedupeText(value) {
@@ -4510,12 +4615,14 @@
         if (shouldUseStandaloneIosAudio()) {
             if (!isStandaloneIosAudioActive()) return 0;
 
+            var order = isStandaloneIosShuffle() ? standaloneIosOrder().slice() : null;
             additions.forEach(function (track) {
+                if (order) order.push(MUSIC_IOS_AUDIO.tracks.length);
                 MUSIC_IOS_AUDIO.tracks.push(track);
                 MUSIC_IOS_AUDIO.playlist.push(buildPlayback(track));
             });
 
-            MUSIC_IOS_AUDIO.shuffleOrder = null;
+            MUSIC_IOS_AUDIO.shuffleOrder = order;
             MUSIC_QUEUE.tracks = MUSIC_IOS_AUDIO.tracks.slice();
             MUSIC_QUEUE.currentIndex = MUSIC_IOS_AUDIO.currentIndex;
             MUSIC_QUEUE.currentTrackId = MUSIC_IOS_AUDIO.tracks[MUSIC_IOS_AUDIO.currentIndex]
@@ -4554,6 +4661,16 @@
     function startRadioFromTrack(track, restoreContext) {
         if (!track || !track.id) return;
 
+        var launchToken = ++MUSIC_PLAY_LAUNCH_TOKEN;
+        MUSIC_SPOTIFY_RELEASE_TOKEN++;
+        var prepareToken = MUSIC_IOS_AUDIO.prepareToken;
+        var player = currentExternalPlayer();
+        function stale() {
+            return launchToken !== MUSIC_PLAY_LAUNCH_TOKEN
+                || prepareToken !== MUSIC_IOS_AUDIO.prepareToken
+                || player !== currentExternalPlayer();
+        }
+
         startMusicPlaybackLoading('Подбираю волну');
 
         var seed = compactRadioTrack(track);
@@ -4562,6 +4679,7 @@
             + '&limit=20';
 
         requestPost(MUSIC.endpoints.radio, payload, function (json) {
+            if (stale()) return;
             stopMusicPlaybackLoading();
 
             var radioTracks = json && json.available && Array.isArray(json.tracks) ? json.tracks : [];
@@ -4577,6 +4695,7 @@
 
             playTrack(track, [track].concat(radioTracks), 0, { forceFresh: true });
         }, function () {
+            if (stale()) return;
             stopMusicPlaybackLoading();
             Lampa.Noty.show('Не удалось подобрать треки.');
             restoreMusicFocusContext(restoreContext);
@@ -4593,6 +4712,28 @@
         if (!generation || MUSIC_RADIO_STATE.pending || MUSIC_RADIO_STATE.lastGeneration === generation)
             return;
 
+        var media = shouldUseStandaloneIosAudio() ? MUSIC_IOS_AUDIO.audio : activeMusicMediaElement();
+        if (!media) return;
+
+        var request = {
+            player: currentExternalPlayer(),
+            launch: MUSIC_PLAY_LAUNCH_TOKEN,
+            queue: radioQueueIdentity(tracks),
+            media: media,
+            waiting: null
+        };
+        request.onIntent = function (event) {
+            if (!request.waiting) return;
+            // A synthetic end can emit a queued seeking event at the same position.
+            if (event.type === 'seeking' && Math.abs(Number(media.currentTime || 0) - request.waiting.time) < 0.5)
+                return;
+            request.waiting = null;
+            request.resumeCancelled = true;
+        };
+        ['play', 'seeking', 'error'].forEach(function (type) {
+            media.addEventListener(type, request.onIntent);
+        });
+        MUSIC_RADIO_STATE.request = request;
         MUSIC_RADIO_STATE.pending = true;
         MUSIC_RADIO_STATE.lastGeneration = generation;
         MUSIC_RADIO_STATE.lastRequestAt = Date.now();
@@ -4601,7 +4742,7 @@
         var exclude = radioExcludeTracks(tracks);
 
         if (!seeds.length) {
-            MUSIC_RADIO_STATE.pending = false;
+            resetRadioAutoplayRequest();
             return;
         }
 
@@ -4610,16 +4751,30 @@
             + '&limit=20';
 
         requestPost(MUSIC.endpoints.radio, payload, function (json) {
-            MUSIC_RADIO_STATE.pending = false;
+            if (MUSIC_RADIO_STATE.request !== request) return;
+            var current = isRadioAutoplayRequestCurrent(request);
+            var resume = current && canResumeRadioAutoplay(request);
+            resetRadioAutoplayRequest();
 
-            if (!json || !json.available || !Array.isArray(json.tracks) || !json.tracks.length)
+            if (!current || !json || !json.available || !Array.isArray(json.tracks) || !json.tracks.length)
                 return;
 
+            var firstAdded = queueTracks().length;
             var added = appendRadioTracksToManagedQueue(json.tracks);
-            if (added > 0)
+            if (added > 0) {
                 Lampa.Noty.show('Радио добавило треки в очередь.');
+                if (resume) {
+                    if (shouldUseStandaloneIosAudio()) {
+                        var nextIndex = standaloneIosNeighborIndex(1);
+                        if (nextIndex >= 0) standaloneIosPlayIndex(nextIndex);
+                    } else {
+                        scheduleTrackPlayed(queueTracks()[firstAdded]);
+                        playEmbeddedQueueIndexInPlace(firstAdded, 'radio-resume');
+                    }
+                }
+            }
         }, function () {
-            MUSIC_RADIO_STATE.pending = false;
+            if (MUSIC_RADIO_STATE.request === request) resetRadioAutoplayRequest();
         });
     }
 
@@ -5553,6 +5708,7 @@
         }
 
         var nextIndex = standaloneIosNeighborIndex(1);
+        if (nextIndex < 0) waitForRadioAutoplay(MUSIC_IOS_AUDIO.audio);
         return nextIndex >= 0 && standaloneIosPlayIndex(nextIndex);
     }
 
@@ -5741,7 +5897,7 @@
         }
 
         if (action === 'stop') {
-            closeStandaloneIosFullPlayer();
+            if (MUSIC_IOS_FULL_PLAYER_OPEN) closeStandaloneIosFullPlayer();
             stopStandaloneIosAudioPlayback();
             return;
         }
@@ -5800,6 +5956,7 @@
         }
 
         if (action === 'playpause') {
+            cancelRadioAutoplayResume();
             if (audio.paused) {
                 traceStandaloneIosAudio('bar-play', '', true);
                 startStandaloneIosKeepAlive('bar-play');
@@ -5822,6 +5979,94 @@
 
     // --- открытие/закрытие фулл-плеера, back-навигация ---
 
+    function refreshStandaloneIosFullFocus() {
+        var player = MUSIC_IOS_FULL_PLAYER;
+        if (!MUSIC_IOS_FULL_PLAYER_OPEN || !player || !player.length) return;
+        if (safeControllerName() !== 'lampac_music_full_player') return;
+
+        var sheetOpen = player.hasClass('lm-ios-full-player--sheet-open');
+        var root = player.find(sheetOpen ? '.lm-ios-full-player__sheet-panel' : '.lm-ios-full-player__shell').get(0);
+        if (!root) return;
+
+        var target = player.data(sheetOpen ? 'sheetFocus' : 'mainFocus');
+        if (!target || !root.contains(target) || !$(target).hasClass('selector') || $(target).hasClass('disabled')) {
+            target = sheetOpen
+                ? $(root).find('.lm-ios-full-player__queue-item--current, .lm-ios-full-player__sheet-row.selector:not(.disabled), .lm-ios-full-player__lyrics-offset .selector').first().get(0)
+                    || $(root).find('[data-action="sheet-close"]').get(0)
+                : $(root).find('[data-action="playpause"]').get(0);
+        }
+
+        Lampa.Controller.collectionSet(root, false, true);
+        Lampa.Controller.collectionFocus(target || false, root);
+    }
+
+    function scheduleStandaloneIosFullFocus() {
+        var player = MUSIC_IOS_FULL_PLAYER;
+        if (!MUSIC_IOS_FULL_PLAYER_OPEN || !player || player.data('focusRefreshTimer')) return;
+
+        // Batch row creation; never rebuild the focus collection on timeupdate.
+        player.data('focusRefreshTimer', setTimeout(function () {
+            player.removeData('focusRefreshTimer');
+            refreshStandaloneIosFullFocus();
+        }, 0));
+    }
+
+    function moveStandaloneIosFullFocus(direction) {
+        var player = MUSIC_IOS_FULL_PLAYER;
+        if (!player || !MUSIC_IOS_FULL_PLAYER_OPEN) return;
+
+        var sheetOpen = player.hasClass('lm-ios-full-player--sheet-open');
+        var target = player.data(sheetOpen ? 'sheetFocus' : 'mainFocus');
+        if (target && $(target).hasClass('lm-ios-full-player__seek') && (direction === 'left' || direction === 'right')) {
+            stepStandaloneIosSeek(target, direction);
+            return;
+        }
+
+        if (target && $(target).hasClass('lm-ios-full-player__lyrics--plain') && (direction === 'up' || direction === 'down')) {
+            var body = player.find('.lm-ios-full-player__sheet-body').get(0);
+            var before = body.scrollTop;
+            body.scrollTop += (direction === 'down' ? 1 : -1) * body.clientHeight * 0.6;
+            if (body.scrollTop !== before) return;
+        }
+
+        Navigator.move(direction);
+    }
+
+    function backStandaloneIosFullPlayer() {
+        var player = MUSIC_IOS_FULL_PLAYER;
+        if (!MUSIC_IOS_FULL_PLAYER_OPEN || !player) return;
+
+        if (player.hasClass('lm-ios-full-player--sheet-open')) {
+            if (player.attr('data-sheet-kind') === 'queue-item') openStandaloneIosQueueSheet();
+            else closeStandaloneIosSheet();
+        } else closeStandaloneIosFullPlayer();
+    }
+
+    function acceptStandaloneIosControlEvent(event, target) {
+        event.preventDefault();
+        event.stopPropagation();
+        if ($(target).hasClass('disabled')) return false;
+
+        var full = $(target).closest('.lm-ios-full-player');
+        if (full.length) {
+            var sheetOpen = full.hasClass('lm-ios-full-player--sheet-open');
+            var inSheet = $(target).closest('.lm-ios-full-player__sheet-panel').length > 0;
+            if (!MUSIC_IOS_FULL_PLAYER_OPEN || sheetOpen !== inSheet) return false;
+            full.data(inSheet ? 'sheetFocus' : 'mainFocus', target);
+        } else {
+            var bar = $(target).closest('.lm-ios-player');
+            if (MUSIC_IOS_FULL_PLAYER_OPEN || !bar.hasClass('lm-ios-player--visible')) return false;
+            bar.data('focusTarget', target);
+        }
+
+        var previous = $(target).data('musicControlEvent');
+        var now = Date.now();
+        // Lampa emits hover:enter shortly after a native click on a selector.
+        if (previous && previous.type !== event.type && now - previous.at < 300) return false;
+        $(target).data('musicControlEvent', { type: event.type, at: now });
+        return true;
+    }
+
     function openStandaloneIosFullPlayer() {
         var player = ensureStandaloneIosFullPlayer();
 
@@ -5832,6 +6077,11 @@
 
         MUSIC_IOS_FULL_PLAYER_OPEN = true;
         player.addClass('lm-ios-full-player--visible');
+        var root = player.get(0);
+        if (root) {
+            root.scrollTop = 0;
+            root.scrollLeft = 0;
+        }
         player.attr('data-scroll-current', 'true');
         $('body').addClass('lm-ios-full-player-open');
         bumpMusicHeatMetric('fullPlayerOpen');
@@ -5840,13 +6090,59 @@
 
         if (Lampa.Controller && typeof Lampa.Controller.add === 'function') {
             Lampa.Controller.add('lampac_music_full_player', {
-                toggle: function () {},
-                back: function () {
-                    closeStandaloneIosFullPlayer();
-                }
+                toggle: refreshStandaloneIosFullFocus,
+                left: function () { moveStandaloneIosFullFocus('left'); },
+                right: function () { moveStandaloneIosFullFocus('right'); },
+                up: function () { moveStandaloneIosFullFocus('up'); },
+                down: function () { moveStandaloneIosFullFocus('down'); },
+                back: backStandaloneIosFullPlayer
             });
             Lampa.Controller.toggle('lampac_music_full_player');
         }
+    }
+
+    function scrollStandaloneIosElement(element, block, smooth) {
+        if (!element || typeof element.getBoundingClientRect !== 'function') return;
+
+        var root = $(element).closest('.lm-ios-full-player').get(0);
+        if (!root) return;
+
+        // overflow:hidden is still programmatically scrollable in WebKit. Keep the
+        // fullscreen root fixed and move only one of the lists owned by the player.
+        root.scrollTop = 0;
+        root.scrollLeft = 0;
+
+        var scroller = $(element).closest('.lm-ios-full-player__queue-list, .lm-ios-full-player__sheet-body').get(0);
+        if (!scroller || !root.contains(scroller)) return;
+
+        var maxScrollTop = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+        if (!maxScrollTop) return;
+
+        var elementBox = element.getBoundingClientRect();
+        var scrollerBox = scroller.getBoundingClientRect();
+        var target = scroller.scrollTop;
+
+        if (block === 'center') {
+            target += elementBox.top - scrollerBox.top - (scroller.clientHeight - elementBox.height) / 2;
+        } else if (elementBox.top < scrollerBox.top) {
+            target += elementBox.top - scrollerBox.top;
+        } else if (elementBox.bottom > scrollerBox.bottom) {
+            target += elementBox.bottom - scrollerBox.bottom;
+        } else {
+            return;
+        }
+
+        target = Math.max(0, Math.min(maxScrollTop, Math.round(target)));
+        if (target === scroller.scrollTop) return;
+
+        if (smooth && typeof scroller.scrollTo === 'function') {
+            try {
+                scroller.scrollTo({ top: target, behavior: 'smooth' });
+                return;
+            } catch (e) {}
+        }
+
+        scroller.scrollTop = target;
     }
 
     function closeStandaloneIosFullPlayer() {
@@ -5855,6 +6151,8 @@
         MUSIC_IOS_FULL_PLAYER_OPEN = false;
 
         if (MUSIC_IOS_FULL_PLAYER && MUSIC_IOS_FULL_PLAYER.length) {
+            clearTimeout(MUSIC_IOS_FULL_PLAYER.data('focusRefreshTimer'));
+            MUSIC_IOS_FULL_PLAYER.removeData('focusRefreshTimer');
             MUSIC_IOS_FULL_PLAYER.removeClass('lm-ios-full-player--visible');
             MUSIC_IOS_FULL_PLAYER.removeAttr('data-seeking');
             MUSIC_IOS_FULL_PLAYER.removeAttr('data-scroll-current');
@@ -5867,8 +6165,11 @@
             var controller = MUSIC_IOS_FULL_PLAYER_RETURN_CONTROLLER || 'content';
 
             MUSIC_IOS_FULL_PLAYER_RETURN_CONTROLLER = 'content';
+            if (controller === 'lampac_music_player_bar' && !standaloneIosPlayerState().active)
+                controller = MUSIC_IOS_BAR.data('returnController') || 'content';
             if (controller !== 'lampac_music_full_player') Lampa.Controller.toggle(controller);
         }
+        flushStandaloneIosDeferredHomeRefresh();
     }
 
     function currentStandaloneIosControllerName() {
@@ -5886,6 +6187,7 @@
 
     function handleStandaloneIosFullPlayerBack(event) {
         if (!MUSIC_IOS_FULL_PLAYER_OPEN) return;
+        if (safeControllerName() !== 'lampac_music_full_player') return;
 
         var key = event && (event.key || event.code || '');
         var code = event && (event.keyCode || event.which || 0);
@@ -5901,7 +6203,8 @@
 
         event.preventDefault();
         event.stopPropagation();
-        closeStandaloneIosFullPlayer();
+        event.stopImmediatePropagation();
+        if (!event.repeat) backStandaloneIosFullPlayer();
     }
 
     // --- нативные свайпы: закрытие плеера и шита жестом ---
@@ -6247,6 +6550,8 @@
         MUSIC_IOS_FULL_PLAYER.removeAttr('data-queue-key');
         MUSIC_IOS_FULL_PLAYER.removeAttr('data-current-index');
         MUSIC_IOS_FULL_PLAYER.removeAttr('data-scroll-current');
+        MUSIC_IOS_FULL_PLAYER.removeData('sheetFocus');
+        refreshStandaloneIosFullFocus();
     }
 
     function showStandaloneIosSheet(title) {
@@ -6257,9 +6562,12 @@
         player.find('.lm-ios-full-player__sheet-title').text(title || '');
         body.removeClass('lm-ios-full-player__sheet-body--queue').empty();
         player.removeAttr('data-sheet-kind');
+        player.removeAttr('data-sheet-track-id');
+        player.removeData('sheetFocus');
         player.addClass('lm-ios-full-player--sheet-open');
         bumpMusicHeatMetric('fullPlayerSheetOpen');
         logStandaloneIosFullEvent('sheet-open', title || '');
+        scheduleStandaloneIosFullFocus();
         return body;
     }
 
@@ -6288,15 +6596,16 @@
         if (options.trailing) row.append(trailing);
 
         if (options.onSelect) {
-            row.on('click', function (event) {
-                event.preventDefault();
-                event.stopPropagation();
-                if (row.hasClass('disabled')) return;
+            if (!options.disabled) row.addClass('selector').attr('data-controller', 'lampac_music_full_player');
+            row.on('click hover:enter', function (event) {
+                if (!acceptStandaloneIosControlEvent(event, this)) return;
                 options.onSelect(row);
             });
         }
 
         body.append(row);
+        bindStandaloneIosFullControls(MUSIC_IOS_FULL_PLAYER, row.filter('.selector'));
+        scheduleStandaloneIosFullFocus();
         return row;
     }
 
@@ -6849,7 +7158,7 @@
                 updateLyricsOffsetValue(player);
 
                 json.lines.forEach(function (line, index) {
-                    var row = $('<div class="lm-ios-full-player__lyrics-line"></div>');
+                    var row = $('<div class="lm-ios-full-player__lyrics-line selector" data-controller="lampac_music_full_player"></div>');
 
                     row.attr('data-line', index);
                     row.attr('data-time', line.time_ms || 0);
@@ -6864,10 +7173,12 @@
                 player.data('lyricsLineMeta', buildLyricsLineMeta(body, '.lm-ios-full-player__lyrics-line'));
                 updateStandaloneIosLyricsHighlight(true);
             } else {
-                var plain = $('<div class="lm-ios-full-player__lyrics lm-ios-full-player__lyrics--plain"></div>');
+                var plain = $('<div class="lm-ios-full-player__lyrics lm-ios-full-player__lyrics--plain selector" data-controller="lampac_music_full_player"></div>');
                 plain.text(json.plain || json.lines.map(function (line) { return line.text || ''; }).join('\n'));
                 body.append(plain);
             }
+            bindStandaloneIosFullControls(player, body.find('.selector'));
+            scheduleStandaloneIosFullFocus();
         };
 
         if (MUSIC_LYRICS_CACHE[trackId]) {
@@ -6929,12 +7240,8 @@
             return;
         }
 
-        if (element && typeof element.scrollIntoView === 'function') {
-            try {
-                element.scrollIntoView({ block: 'center', behavior: force ? 'auto' : 'smooth' });
-            } catch (e) {
-                element.scrollIntoView();
-            }
+        if (element) {
+            scrollStandaloneIosElement(element, 'center', !force);
             bumpMusicHeatMetric('fullPlayerLyricsScroll');
         }
 
@@ -6986,6 +7293,7 @@
         if (!MUSIC_IOS_SLEEP_TIMER.endAt) return false;
         if (!force && Date.now() < MUSIC_IOS_SLEEP_TIMER.endAt) return false;
 
+        cancelRadioAutoplayResume();
         if (MUSIC_IOS_SLEEP_TIMER.timer) {
             clearTimeout(MUSIC_IOS_SLEEP_TIMER.timer);
             MUSIC_IOS_SLEEP_TIMER.timer = 0;
@@ -7126,13 +7434,55 @@
             + '</div>'
         );
 
-        player.on('click', '[data-action]', function (event) {
-            event.preventDefault();
-            event.stopPropagation();
+        player.find('[data-action], .lm-ios-full-player__seek').addClass('selector').attr('data-controller', 'lampac_music_full_player');
+        bindStandaloneIosFullControls(player, player.find('.selector'));
+
+        player.on('click', '.lm-ios-full-player__sheet', function (event) {
+            if (event.target === this) closeStandaloneIosSheet();
+        });
+
+        player.on('touchstart', '.lm-ios-full-player__lyrics', function () {
+            player.attr('data-lyrics-manual', String(Date.now()));
+        });
+
+        bindStandaloneIosFullPlayerGestures(player);
+
+        // Capture Back once, before Lampa also dispatches it to the active controller.
+        document.addEventListener('keydown', handleStandaloneIosFullPlayerBack, true);
+
+        $('body').append(player);
+        MUSIC_IOS_FULL_PLAYER = player;
+        return MUSIC_IOS_FULL_PLAYER;
+    }
+
+    function bindStandaloneIosFullControls(player, controls) {
+        // Lampa's hover events do not bubble: bind to each control, including new sheet rows.
+        controls = controls.filter(function () {
+            if ($(this).data('musicControlsBound')) return false;
+            $(this).data('musicControlsBound', true);
+            return true;
+        });
+
+        controls.on('hover:focus hover:hover', function () {
+            var inSheet = $(this).closest('.lm-ios-full-player__sheet-panel').length > 0;
+            player.data(inSheet ? 'sheetFocus' : 'mainFocus', this);
+            if ($(this).hasClass('lm-ios-full-player__lyrics-line'))
+                player.attr('data-lyrics-manual', String(Date.now()));
+            if (inSheet)
+                scrollStandaloneIosElement(this, 'nearest', false);
+        });
+
+        controls.filter('.lm-ios-full-player__seek').on('keydown', function (event) {
+            if (safeControllerName() === 'lampac_music_full_player' && (event.keyCode === 37 || event.keyCode === 39))
+                event.preventDefault();
+        });
+
+        controls.filter('[data-action]').on('click hover:enter', function (event) {
+            if (!acceptStandaloneIosControlEvent(event, this)) return;
             handleStandaloneIosPlayerAction($(this).attr('data-action'));
         });
 
-        player.on('input', '.lm-ios-full-player__seek', function () {
+        controls.filter('.lm-ios-full-player__seek').on('input', function () {
             var state = standaloneIosPlayerState();
             var value = Number($(this).val() || 0);
             var position = state.duration ? (state.duration * value / 1000) : 0;
@@ -7142,14 +7492,14 @@
             player.find('.lm-ios-full-player__time--current').text(Lampa.Utils.secondsToTime(position));
         });
 
-        player.on('change', '.lm-ios-full-player__seek', function () {
+        controls.filter('.lm-ios-full-player__seek').on('change', function () {
             player.removeAttr('data-seeking');
             seekStandaloneIosByRangeValue($(this).val());
         });
 
         // лонг-тап по треку очереди → меню действий (убрать/переставить);
         // touchmove отменяет таймер, чтобы скролл списка не открывал меню
-        var queueItemHold = { timer: 0, fired: false };
+        var queueItemHold = { timer: 0, target: null };
 
         function clearQueueItemHoldTimer() {
             if (queueItemHold.timer) {
@@ -7158,47 +7508,45 @@
             }
         }
 
-        player.on('touchstart', '.lm-ios-full-player__queue-item', function () {
+        controls.filter('.lm-ios-full-player__queue-item').on('touchstart', function () {
             var index = Number($(this).attr('data-index') || 0);
+            var target = this;
 
-            queueItemHold.fired = false;
+            queueItemHold.target = null;
             clearQueueItemHoldTimer();
             queueItemHold.timer = setTimeout(function () {
                 queueItemHold.timer = 0;
-                queueItemHold.fired = true;
+                queueItemHold.target = target;
                 openStandaloneIosQueueItemMenu(index);
             }, 550);
         });
 
-        player.on('touchmove touchend touchcancel', '.lm-ios-full-player__queue-item', function () {
+        controls.filter('.lm-ios-full-player__queue-item').on('touchmove touchend touchcancel', function () {
             clearQueueItemHoldTimer();
         });
 
-        player.on('contextmenu', '.lm-ios-full-player__queue-item', function (event) {
+        controls.filter('.lm-ios-full-player__queue-item').on('contextmenu hover:long', function (event) {
             event.preventDefault();
-            queueItemHold.fired = true;
+            event.stopPropagation();
+            if (queueItemHold.target === this) return;
+            queueItemHold.target = this;
+            clearQueueItemHoldTimer();
             openStandaloneIosQueueItemMenu(Number($(this).attr('data-index') || 0));
         });
 
-        player.on('click', '.lm-ios-full-player__queue-item', function (event) {
-            event.preventDefault();
-            event.stopPropagation();
+        controls.filter('.lm-ios-full-player__queue-item').on('click hover:enter', function (event) {
+            if (!acceptStandaloneIosControlEvent(event, this)) return;
 
-            if (queueItemHold.fired) {
-                queueItemHold.fired = false;
+            if (queueItemHold.target === this) {
+                queueItemHold.target = null;
                 return;
             }
 
             standaloneIosPlayIndex(Number($(this).attr('data-index') || 0));
         });
 
-        player.on('click', '.lm-ios-full-player__sheet', function (event) {
-            if (event.target === this) closeStandaloneIosSheet();
-        });
-
-        player.on('click', '.lm-ios-full-player__lyrics-line', function (event) {
-            event.preventDefault();
-            event.stopPropagation();
+        controls.filter('.lm-ios-full-player__lyrics-line').on('click hover:enter', function (event) {
+            if (!acceptStandaloneIosControlEvent(event, this)) return;
 
             var audio = MUSIC_IOS_AUDIO.audio;
             var time = Number($(this).attr('data-time') || 0) + getLyricsOffsetMs(player);
@@ -7213,31 +7561,18 @@
             updateStandaloneIosLyricsHighlight(true);
         });
 
-        player.on('click hover:enter', '[data-lyrics-offset-delta]', function (event) {
-            event.preventDefault();
-            event.stopPropagation();
+        controls.filter('[data-lyrics-offset-delta]').on('click hover:enter', function (event) {
+            if (!acceptStandaloneIosControlEvent(event, this)) return;
             changeLyricsOffset(player, Number($(this).attr('data-lyrics-offset-delta') || 0));
             updateStandaloneIosLyricsHighlight(true);
         });
 
-        player.on('click hover:enter', '[data-lyrics-offset-reset]', function (event) {
-            event.preventDefault();
-            event.stopPropagation();
+        controls.filter('[data-lyrics-offset-reset]').on('click hover:enter', function (event) {
+            if (!acceptStandaloneIosControlEvent(event, this)) return;
             changeLyricsOffset(player, -getLyricsOffsetMs(player));
             updateStandaloneIosLyricsHighlight(true);
         });
 
-        player.on('touchstart', '.lm-ios-full-player__lyrics', function () {
-            player.attr('data-lyrics-manual', String(Date.now()));
-        });
-
-        bindStandaloneIosFullPlayerGestures(player);
-
-        $(document).on('keydown.lampacMusicFullPlayer', handleStandaloneIosFullPlayerBack);
-
-        $('body').append(player);
-        MUSIC_IOS_FULL_PLAYER = player;
-        return MUSIC_IOS_FULL_PLAYER;
     }
 
     function updateStandaloneIosFullQueue(player, state) {
@@ -7287,7 +7622,7 @@
                     list.append($('<div class="lm-ios-full-player__queue-divider"></div>').text('Дальше автоподборка'));
                 }
 
-                var item = $('<div class="lm-ios-full-player__queue-item"></div>');
+                var item = $('<div class="lm-ios-full-player__queue-item selector" data-controller="lampac_music_full_player"></div>');
                 var imageWrap = $('<div class="lm-ios-full-player__queue-img"></div>');
                 var img = $('<img src="" alt="">');
                 var body = $('<div class="lm-ios-full-player__queue-body"></div>');
@@ -7309,9 +7644,11 @@
                 item.append(time);
                 list.append(item);
             });
+            bindStandaloneIosFullControls(player, list.find('.selector'));
             bumpMusicHeatMetric('fullPlayerQueueRender');
             bumpMusicHeatMetric('fullPlayerQueueRenderItems', tracks.length);
             bumpMusicHeatDuration('fullPlayerQueueRender', renderStartedAt);
+            scheduleStandaloneIosFullFocus();
         }
 
         var durationKey = tracks.map(function (track) {
@@ -7344,13 +7681,8 @@
 
             player.removeAttr('data-scroll-current');
 
-            if (scroller && current) {
-                try {
-                    current.scrollIntoView({ block: 'center' });
-                } catch (e) {
-                    scroller.scrollTop = Math.max(0, current.offsetTop - (scroller.clientHeight / 2) + (current.clientHeight / 2));
-                }
-            }
+            if (scroller && current)
+                scrollStandaloneIosElement(current, 'center', false);
         }
 
         bumpMusicHeatDuration('fullPlayerQueueUpdate', heatStartedAt);
@@ -7461,6 +7793,45 @@
 
     // --- мини-бар плеера ---
 
+    function stepStandaloneIosSeek(target, direction) {
+        var state = standaloneIosPlayerState();
+        if (!state.duration) return;
+        var value = Math.max(0, Math.min(1000, Number($(target).val() || 0) + (direction === 'right' ? 5000 : -5000) / state.duration));
+        $(target).val(value);
+        seekStandaloneIosByRangeValue(value);
+    }
+
+    function focusStandaloneIosPlayerBar() {
+        var bar = MUSIC_IOS_BAR;
+        if (!bar || !bar.hasClass('lm-ios-player--visible') || MUSIC_IOS_FULL_PLAYER_OPEN) return;
+
+        var current = safeControllerName();
+        if (current !== 'lampac_music_player_bar') {
+            bar.data('returnController', current && current !== 'lampac_music_full_player' ? current : 'content');
+            Lampa.Controller.toggle('lampac_music_player_bar');
+            return;
+        }
+
+        var target = bar.data('focusTarget');
+        if (!target || !bar.get(0).contains(target) || $(target).hasClass('disabled'))
+            target = bar.find('[data-action="expand"]').get(0);
+        Lampa.Controller.collectionSet(bar.get(0));
+        Lampa.Controller.collectionFocus(target, bar.get(0));
+    }
+
+    function leaveStandaloneIosPlayerBar() {
+        if (safeControllerName() !== 'lampac_music_player_bar') return;
+        Lampa.Controller.toggle(MUSIC_IOS_BAR.data('returnController') || 'content');
+        flushStandaloneIosDeferredHomeRefresh();
+    }
+
+    function moveStandaloneIosBarFocus(direction) {
+        var target = MUSIC_IOS_BAR.data('focusTarget');
+        if (target && $(target).hasClass('lm-ios-player__seek') && (direction === 'left' || direction === 'right'))
+            stepStandaloneIosSeek(target, direction);
+        else Navigator.move(direction);
+    }
+
     function ensureStandaloneIosPlayerBar() {
         if (MUSIC_IOS_BAR && MUSIC_IOS_BAR.length) return MUSIC_IOS_BAR;
 
@@ -7489,14 +7860,19 @@
             + '</div>'
         );
 
-        bar.on('click', '[data-action]', function (event) {
-            event.preventDefault();
-            event.stopPropagation();
+        var controls = bar.find('[data-action], .lm-ios-player__seek');
+        controls.addClass('selector').attr('data-controller', 'lampac_music_player_bar');
+        controls.on('hover:focus hover:hover', function () {
+            bar.data('focusTarget', this);
+        });
+        controls.filter('[data-action]').on('click hover:enter', function (event) {
+            if (!acceptStandaloneIosControlEvent(event, this)) return;
+            if (Lampa.Platform.screen('tv')) focusStandaloneIosPlayerBar();
             handleStandaloneIosPlayerAction($(this).attr('data-action'));
         });
-
-        bar.on('hover:enter', '[data-action]', function () {
-            handleStandaloneIosPlayerAction($(this).attr('data-action'));
+        controls.filter('.lm-ios-player__seek').on('keydown', function (event) {
+            if (safeControllerName() === 'lampac_music_player_bar' && (event.keyCode === 37 || event.keyCode === 39))
+                event.preventDefault();
         });
 
         bar.on('input', '.lm-ios-player__seek', function () {
@@ -7515,6 +7891,14 @@
 
         $('body').append(bar);
         MUSIC_IOS_BAR = bar;
+        Lampa.Controller.add('lampac_music_player_bar', {
+            toggle: focusStandaloneIosPlayerBar,
+            left: function () { moveStandaloneIosBarFocus('left'); },
+            right: function () { moveStandaloneIosBarFocus('right'); },
+            up: function () { moveStandaloneIosBarFocus('up'); },
+            down: function () { moveStandaloneIosBarFocus('down'); },
+            back: leaveStandaloneIosPlayerBar
+        });
         return MUSIC_IOS_BAR;
     }
 
@@ -7533,6 +7917,10 @@
             MUSIC_IOS_AUDIO.fullPlaybackKey = '';
             MUSIC_IOS_AUDIO.fullProgressKey = '';
             bar.removeClass('lm-ios-player--visible');
+            if (!MUSIC_IOS_AUDIO.active) {
+                MUSIC_IOS_AUDIO.barFocusRequested = false;
+                leaveStandaloneIosPlayerBar();
+            }
             updateStandaloneIosFullPlayer();
             return;
         }
@@ -7574,6 +7962,10 @@
         }
 
         bar.addClass('lm-ios-player--visible');
+        if (MUSIC_IOS_AUDIO.barFocusRequested) {
+            MUSIC_IOS_AUDIO.barFocusRequested = false;
+            focusStandaloneIosPlayerBar();
+        }
         updateStandaloneIosFullPlayer();
     }
 
@@ -7876,6 +8268,7 @@
                 }
             });
             setMediaSessionHandler('pause', function () {
+                cancelRadioAutoplayResume();
                 var media = standaloneIosAudioElement();
                 if (!media) return;
 
@@ -7952,6 +8345,7 @@
     // --- запуск/остановка standalone-воспроизведения, смена трека ---
 
     function stopStandaloneIosAudioPlayback() {
+        resetRadioAutoplayRequest();
         clearStandaloneIosSleepTimer(false);
 
         if (MUSIC_IOS_AUDIO.audio) {
@@ -8028,6 +8422,7 @@
         if (!audio || !playback || !playback.url || !track) return false;
         if (MUSIC_IOS_AUDIO.switching) return false;
 
+        cancelRadioAutoplayResume();
         MUSIC_IOS_AUDIO.switching = true;
         MUSIC_IOS_AUDIO.playing = false;
         MUSIC_IOS_AUDIO.playWatchToken++;
@@ -8037,10 +8432,14 @@
         updateStandaloneIosPlayerBar();
 
         if (typeof playback.url === 'function') {
+            var resolveToken = MUSIC_IOS_AUDIO.playWatchToken;
+            var prepareToken = MUSIC_IOS_AUDIO.prepareToken;
             syncStandaloneIosMediaSession();
             updateStandaloneIosPositionState();
 
             playback.url(function () {
+                if (resolveToken !== MUSIC_IOS_AUDIO.playWatchToken
+                    || prepareToken !== MUSIC_IOS_AUDIO.prepareToken) return;
                 MUSIC_IOS_AUDIO.switching = false;
 
                 if (!playback.url || typeof playback.url !== 'string') {
@@ -8057,7 +8456,8 @@
                     return;
                 }
 
-                standaloneIosPlayIndex(index);
+                var target = MUSIC_IOS_AUDIO.tracks.indexOf(track);
+                if (target >= 0) standaloneIosPlayIndex(target);
             });
 
             return true;
@@ -8114,6 +8514,7 @@
         MUSIC_IOS_AUDIO.prepareToken = (MUSIC_IOS_AUDIO.prepareToken || 0) + 1;
         MUSIC_IOS_AUDIO.shuffleOrder = null;
         MUSIC_IOS_AUDIO.resumePosition = Math.max(0, Number(resumePosition || 0));
+        MUSIC_IOS_AUDIO.barFocusRequested = Lampa.Platform.screen('tv') && !MUSIC_IOS_FULL_PLAYER_OPEN;
         updateStandaloneIosPlayerBar();
         startStandaloneIosKeepAlive('playlist-start');
 
@@ -8617,6 +9018,11 @@
 
         if (!track) return false;
 
+        cancelRadioAutoplayResume();
+        if (origin === 'radio-resume' && musicPlayerPanelEndedCleanup) {
+            clearTimeout(musicPlayerPanelEndedCleanup);
+            musicPlayerPanelEndedCleanup = 0;
+        }
         MUSIC_EMBEDDED_IOS.navigationIndex = index;
 
         // Lampa вычисляет позицию PlayerPlaylist по current URL. Отмечаем
@@ -8650,6 +9056,8 @@
             if (!switchEmbeddedMediaSource(media, playback.url))
                 return;
 
+            // The normal end cleanup may have detached the panel while radio was loading.
+            if (origin === 'radio-resume') startMusicPlayerPanelFix(playback);
             startStandaloneIosKeepAlive('embedded-inplace');
             syncMusicMediaSession(playback);
             updateMediaSessionPositionState();
@@ -8734,6 +9142,7 @@
     }
 
     function pauseEmbeddedMusicMedia(origin) {
+        cancelRadioAutoplayResume();
         var media = activeMusicMediaElement();
         if (!media) return;
 
@@ -8955,6 +9364,7 @@
 
         setMediaSessionHandler('pause', function () {
             var currentData = activePlayerData() || data;
+            cancelRadioAutoplayResume();
             var media = activeMusicMediaElement();
 
             if (shouldUseEmbeddedIosLockscreenSupport(currentData)) {
@@ -9230,7 +9640,9 @@
     }
 
     function selectFromStandaloneIosQueue(index) {
-        return standaloneIosPlayIndex(index);
+        var selected = standaloneIosPlayIndex(index);
+        if (selected && Lampa.Platform.screen('tv')) focusStandaloneIosPlayerBar();
+        return selected;
     }
 
     function requestPlay(track, done, fail) {
@@ -9246,7 +9658,8 @@
             // всегда) запускал плеер в одном тике с warmup — ломался скраббер
             if (done) {
                 setTimeout(function () {
-                    done(cached);
+                    if (getCachedPlayResponse(track) === cached) done(cached);
+                    else if (fail) fail(null);
                 }, 0);
             }
             return;
@@ -9263,14 +9676,19 @@
         }
 
         bumpMusicHeatMetric('playNetwork');
-        PLAY_PREFETCH_PENDING[key] = [{
+        var callbacks = PLAY_PREFETCH_PENDING[key] = [{
             done: done,
             fail: fail
         }];
 
+        // Холодный YouTube-резолв иногда дольше общего сетевого таймаута
+        // клиента (особенно для Spotify-треков без duration/isrc). Не обрываем
+        // живой серверный запрос на 20-й секунде: lazy URL штатного плеера после
+        // такого обрыва превращался в пустую строку и Lampa показывала ложное
+        // «Видео не найдено или повреждено».
         request(buildPlayUrl(track), function (json) {
+            if (PLAY_PREFETCH_PENDING[key] !== callbacks) return;
             var parsed = parseJson(json);
-            var callbacks = PLAY_PREFETCH_PENDING[key] || [];
             delete PLAY_PREFETCH_PENDING[key];
 
             if (parsed && parsed.available && parsed.sources && parsed.sources.length) {
@@ -9285,12 +9703,12 @@
                 if (cb.fail) cb.fail(parsed);
             });
         }, function () {
-            var callbacks = PLAY_PREFETCH_PENDING[key] || [];
+            if (PLAY_PREFETCH_PENDING[key] !== callbacks) return;
             delete PLAY_PREFETCH_PENDING[key];
             callbacks.forEach(function (cb) {
                 if (cb.fail) cb.fail(null);
             });
-        });
+        }, 45000);
     }
 
     function normalizePlayedMs(track, playedMs) {
@@ -9308,6 +9726,18 @@
         return value > 0 ? params + '&played_ms=' + encodeURIComponent(value) : params;
     }
 
+    function buildHistoryRequestParams(track) {
+        var params = buildTrackRequestParams(track);
+        var image = selectSizedImage(track && track.images, 250);
+        if (typeof image !== 'string') return params;
+
+        image = image.trim();
+        if (image.indexOf('//') === 0) image = 'https:' + image;
+        if (!/^https?:\/\//i.test(image) || image.length > 8192) return params;
+
+        return params + '&image=' + encodeURIComponent(image);
+    }
+
     function markTrackPlayed(track, playedMs) {
         if (!track || !track.id) return;
 
@@ -9318,7 +9748,7 @@
         // count_play — только здесь: это честный play-путь (после задержки
         // реального воспроизведения); refreshRecentlyPlayedTrack обновляет
         // payload без прослушивания и счётчик статистики не трогает
-        requestPost(MUSIC.endpoints.markHistory, appendPlayedMsParam(buildTrackRequestParams(track) + '&count_play=true', track, playedMs), function () {
+        requestPost(MUSIC.endpoints.markHistory, appendPlayedMsParam(buildHistoryRequestParams(track) + '&count_play=true', track, playedMs), function () {
             refreshStatsTopAfterPlayedTrack();
         }, function () {});
     }
@@ -9329,7 +9759,7 @@
         var value = normalizePlayedMs(track, playedMs);
         if (value <= 0) return;
 
-        requestPost(MUSIC.endpoints.markHistory, appendPlayedMsParam(buildTrackRequestParams(track), track, value), function () {}, function () {});
+        requestPost(MUSIC.endpoints.markHistory, appendPlayedMsParam(buildHistoryRequestParams(track), track, value), function () {}, function () {});
     }
 
     function refreshRecentlyPlayedTrack(track) {
@@ -9338,7 +9768,7 @@
         touchHomeCacheEntry('recently_played', mapTrackCard(track), RECENT_SECTION_STORAGE_LIMIT);
         updateHomeSectionMetaFromCache('recently_played');
         emitRecentChanged('recently_played', track);
-        requestPost(MUSIC.endpoints.markHistory, buildTrackRequestParams(track), function () {}, function () {});
+        requestPost(MUSIC.endpoints.markHistory, buildHistoryRequestParams(track), function () {}, function () {});
     }
 
     function findQueueTrackById(trackId) {
@@ -9512,9 +9942,10 @@
     // --- авто-скип мёртвого трека очереди ---
     // Раньше провал резолва был тупиком: Noty + стоящая очередь, дальше только
     // руками. Скипаем ТОЛЬКО честный отказ сервера (available=false — все
-    // провайдеры не нашли источник); сетевой сбой (json=null/битый ответ) НЕ
-    // скипаем — iOS душит сеть скрытой страницы, и авто-скип прощёлкал бы
-    // живые треки под локскрином. Кап подряд идущих скипов ограничивает
+    // провайдеры не нашли источник); сбой клиент↔Lampac (json=null/битый ответ)
+    // и сервер↔audio-provider (reason=transient) НЕ скипаем — iOS душит сеть
+    // скрытой страницы, и авто-скип прощёлкал бы живые треки под локскрином.
+    // Кап подряд идущих скипов ограничивает
     // каскад по мёртвой полосе плейлиста; счётчик сбрасывается только на
     // реальном старте звука (playing с настоящим src), не на выборе трека.
     var MUSIC_AUTO_SKIP_LIMIT = 3;
@@ -9526,6 +9957,7 @@
 
     function maybeAutoSkipUnavailableTrack(json, advance) {
         if (!json || json.available !== false) return false;
+        if (json.reason === 'transient') return false;
         if (getStandaloneIosRepeatMode() === 'one') return false;
 
         if (MUSIC_AUTO_SKIP_COUNT >= MUSIC_AUTO_SKIP_LIMIT) {
@@ -9622,8 +10054,16 @@
                 var embeddedResolveToken = shouldUseStandaloneIosAudio()
                     ? 0
                     : ++MUSIC_EMBEDDED_IOS.switchToken;
+                var standaloneResolveToken = embeddedResolveToken ? null : MUSIC_IOS_AUDIO.playWatchToken;
+                var standalonePrepareToken = MUSIC_IOS_AUDIO.prepareToken;
+                function standaloneStale() {
+                    return standaloneResolveToken !== null
+                        && (standaloneResolveToken !== MUSIC_IOS_AUDIO.playWatchToken
+                            || standalonePrepareToken !== MUSIC_IOS_AUDIO.prepareToken);
+                }
 
                 requestPlay(track, function (json) {
+                    if (standaloneStale()) return;
                     if (embeddedResolveToken && embeddedResolveToken !== MUSIC_EMBEDDED_IOS.switchToken) {
                         traceEmbeddedIos('playlist-resolve-stale', track && track.id ? track.id : '', true);
                         return;
@@ -9641,6 +10081,7 @@
                     playback.music_duration_ms = track.duration_ms || playback.music_duration_ms;
                     call();
                 }, function (json) {
+                    if (standaloneStale()) return;
                     if (embeddedResolveToken && embeddedResolveToken !== MUSIC_EMBEDDED_IOS.switchToken) {
                         traceEmbeddedIos('playlist-resolve-failed-stale', track && track.id ? track.id : '', true);
                         return;
@@ -9656,6 +10097,7 @@
                     playback.url = '';
 
                     if (!maybeAutoSkipUnavailableTrack(json, function () {
+                        if (standaloneStale()) return;
                         if (embeddedResolveToken && embeddedResolveToken !== MUSIC_EMBEDDED_IOS.switchToken) return;
                         advanceQueueAfterUnavailable(track && track.id, playback);
                     }))
@@ -9780,9 +10222,15 @@
             var media = activeMusicMediaElement();
 
             if (!data || !data.from_music_cluster || !media || media.ended || media.error) {
+                var request = MUSIC_RADIO_STATE.request;
+                var waiting = isRadioAutoplayRequestCurrent(request) && canResumeRadioAutoplay(request)
+                    ? request.waiting : null;
                 traceEmbeddedIos('panel-cleanup', origin || '', true);
                 stopMusicPlayerPanelFix();
                 syncMusicMediaSession(null);
+                // End cleanup invalidates source switches, but is not a user navigation command.
+                if (waiting && MUSIC_RADIO_STATE.request === request && request.waiting === waiting)
+                    waiting.switchToken = MUSIC_EMBEDDED_IOS.switchToken;
             }
         }, 900);
     }
@@ -9805,11 +10253,17 @@
 
         if (media && isFinite(media.currentTime)) {
             var current = Number(media.currentTime);
+            var wallDelta = pending.lastWallAt ? Math.max(0, now - pending.lastWallAt) : 0;
 
             if (typeof pending.lastMediaTime === 'number' && isFinite(pending.lastMediaTime)) {
                 var mediaDelta = current - pending.lastMediaTime;
-                if (mediaDelta > 0 && mediaDelta < 30)
-                    pending.playedMs += Math.round(mediaDelta * 1000);
+                if (media.paused !== true && media.seeking !== true && mediaDelta > 0 && mediaDelta < 30) {
+                    // A seek can move currentTime by many seconds between two
+                    // adjacent events. Credit no more than real elapsed time,
+                    // so changing position cannot forge listening.
+                    var creditedMs = Math.min(mediaDelta * 1000, wallDelta);
+                    pending.playedMs += Math.max(0, Math.round(creditedMs));
+                }
             }
 
             pending.lastMediaTime = current;
@@ -9986,11 +10440,16 @@
 
     // ===== LAMPA PLAYER BRIDGE =====
 
-    function attachInternalPlaylistDeferred(trackId, list) {
+    function attachInternalPlaylistDeferred(trackId, list, isStale) {
         if (!trackId || !list || !list.length) return;
 
         [80, 300].forEach(function (delay) {
             setTimeout(function () {
+                if (isStale && isStale()) {
+                    traceEmbeddedIos('playlist-attach-stale', 'delay=' + delay, true);
+                    return;
+                }
+
                 var work = activePlayerData();
                 if (!work || !work.from_music_cluster || work.music_track_id !== trackId) {
                     traceEmbeddedIos('playlist-attach-bail', 'delay=' + delay + ' work=' + !!work
@@ -10121,6 +10580,7 @@
         if (playEmbeddedQueueOffset(1))
             return true;
 
+        waitForRadioAutoplay(media);
         updateEmbeddedIosPlaybackState();
         return true;
     }
@@ -10576,6 +11036,7 @@
                     traceEmbeddedIos('panel-' + event.type, '', true);
                     clearEmbeddedIosLockscreenSupport(event.type);
                     updateEmbeddedIosPlaybackState();
+                    if (event.type === 'ended') waitForRadioAutoplay(media);
                     scheduleMusicPlayerPanelEndCleanup(event.type);
                     return;
                 }
@@ -10657,6 +11118,7 @@
     });
 
     Lampa.Player.listener.follow('destroy', function () {
+        if (!shouldUseStandaloneIosAudio()) resetRadioAutoplayRequest();
         clearPendingInternalPlaylist();
         clearPendingTrackPlayed();
     });
@@ -10832,6 +11294,7 @@
     }
 
     function buildStandaloneIosPreparedPlaylist(tracks, startIndex, currentJson, done, providerId) {
+        tracks = tracks.slice();
         if (!shouldUseStagedStandaloneIosPreparation(providerId)) {
             buildInternalPreparedPlaylist(tracks, startIndex, currentJson, function (preparedList) {
                 done(preparedList, null);
@@ -10910,18 +11373,23 @@
                 }
 
                 var entryIndex = backgroundOrder[pointer++];
+                var currentIndex = (MUSIC_IOS_AUDIO.tracks || []).indexOf(tracks[entryIndex]);
+                var pendingPlayback = currentIndex >= 0 && MUSIC_IOS_AUDIO.playlist[currentIndex];
+                if (!pendingPlayback) {
+                    scheduleWarm(warmDelay);
+                    return;
+                }
                 active = true;
                 bumpMusicHeatMetric('standaloneWarmRequest');
 
                 requestPlay(tracks[entryIndex], function (json) {
                     active = false;
-                    if (stillCurrent() && MUSIC_IOS_AUDIO.playlist && entryIndex < MUSIC_IOS_AUDIO.playlist.length)
-                        MUSIC_IOS_AUDIO.playlist[entryIndex] = buildResolvedPlayback(tracks[entryIndex], json);
+                    var target = stillCurrent() ? MUSIC_IOS_AUDIO.playlist.indexOf(pendingPlayback) : -1;
+                    if (target >= 0)
+                        MUSIC_IOS_AUDIO.playlist[target] = buildResolvedPlayback(tracks[entryIndex], json);
                     scheduleWarm(warmDelay);
                 }, function () {
                     active = false;
-                    if (stillCurrent() && MUSIC_IOS_AUDIO.playlist && entryIndex < MUSIC_IOS_AUDIO.playlist.length)
-                        MUSIC_IOS_AUDIO.playlist[entryIndex] = buildPlayback(tracks[entryIndex]);
                     scheduleWarm(warmDelay);
                 });
             }
@@ -10966,6 +11434,8 @@
     }
 
     function playTrack(track, playlistTracks, startIndex, options) {
+        resetRadioAutoplayRequest();
+        var launchToken = ++MUSIC_PLAY_LAUNCH_TOKEN;
         if (playSpotifyReleaseTrack(track, playlistTracks, startIndex, options)) return;
 
         MUSIC_SPOTIFY_RELEASE_TOKEN++;
@@ -10974,7 +11444,6 @@
         var standaloneIos = shouldUseStandaloneIosAudio();
         var forceFresh = !!(options && options.forceFresh);
         var resumePosition = Math.max(0, Number(options && options.resumePosition || 0));
-        var launchToken = ++MUSIC_PLAY_LAUNCH_TOKEN;
         // оверлей предыдущего (только что отменённого) запуска гасим сразу:
         // дальше любой видимый лоадер принадлежит только новейшему флоу
         stopMusicPlaybackLoading();
@@ -11079,8 +11548,9 @@
                     if (!(tracks.length > 1 && usesInternalPlaybackFlow())) {
                         Lampa.Player.playlist(list);
                     } else {
-                        attachInternalPlaylistDeferred(tracks[index].id, list);
+                        attachInternalPlaylistDeferred(tracks[index].id, list, launchStale);
                         setTimeout(function () {
+                            if (launchStale()) return;
                             var work = activePlayerData();
                             if (work && work.from_music_cluster && work.music_track_id) {
                                 flushPendingInternalPlaylist(work.music_track_id);
@@ -13117,7 +13587,8 @@
             html.addClass('loaded');
         });
         img.on('error', function () {
-            img.attr('src', item.image || IMG_BG);
+            if (img.attr('src') !== IMG_BG)
+                img.attr('src', IMG_BG);
             html.addClass('loaded');
         });
         img.attr('src', item.image || IMG_BG);
@@ -13334,6 +13805,7 @@
 
         instance.start = function () {
             if (Lampa.Activity.active().activity !== instance.activity) return;
+            if (isStandaloneIosPlayerForeground()) return;
 
             Lampa.Controller.add('content', {
                 toggle: function () {
@@ -13454,6 +13926,7 @@
 
         var baseStart = this.start;
         this.start = function () {
+            if (isStandaloneIosPlayerForeground()) return;
             baseStart();
 
             if (homeMode && (recentDirty || MUSIC_DEFERRED_HOME_REFRESH)) {
@@ -13472,7 +13945,7 @@
 
             recentDirty = true;
 
-            if (isLampaPlayerOverlayOpen()) {
+            if (isLampaPlayerOverlayOpen() || isStandaloneIosPlayerForeground()) {
                 traceEmbeddedIos('recent-refresh-deferred', detail.section_key || '', true);
                 return;
             }
@@ -13738,6 +14211,7 @@
 
             requestAnimationFrame(function () {
                 if (destroyed || !homeMode || Lampa.Activity.active().activity !== _this.activity) return;
+                if (isStandaloneIosPlayerForeground()) return;
 
                 var lineIndex = -1;
                 for (var i = 0; i < homeLines.length; i++) {
@@ -13754,6 +14228,7 @@
 
                 function restoreHomeLine() {
                     if (destroyed || !homeMode || Lampa.Activity.active().activity !== _this.activity) return;
+                    if (isStandaloneIosPlayerForeground()) return;
                     openHomeLine(lineIndex);
                 }
 
@@ -14650,6 +15125,11 @@
 
                 loadStatsTopSummary(function (stats) {
                     if (destroyed) return;
+                    if (isStandaloneIosPlayerForeground()) {
+                        MUSIC_DEFERRED_HOME_REFRESH = true;
+                        _this.activity.loader(false);
+                        return;
+                    }
 
                     sections.user_playlists = applySectionKey(buildUserPlaylistCardsWithStats(
                         home && Array.isArray(home.user_playlists) ? home.user_playlists : [],
@@ -14989,6 +15469,7 @@
 
         var baseStart = this.start;
         this.start = function () {
+            if (isStandaloneIosPlayerForeground()) return;
             baseStart();
 
             if (sectionDirty) {
@@ -15004,7 +15485,7 @@
 
             sectionDirty = true;
 
-            if (isLampaPlayerOverlayOpen()) {
+            if (isLampaPlayerOverlayOpen() || isStandaloneIosPlayerForeground()) {
                 traceEmbeddedIos('section-refresh-deferred', detail.section_key || '', true);
                 return;
             }
@@ -15739,7 +16220,9 @@
                 posterImg.css('opacity', 1);
             });
             posterImg.on('error', function () {
-                posterImg.attr('src', img).css('opacity', 1);
+                if (posterImg.attr('src') !== IMG_BG)
+                    posterImg.attr('src', IMG_BG);
+                posterImg.css('opacity', 1);
             });
             posterImg.attr('src', img);
 
@@ -16020,7 +16503,9 @@
                     posterImg.css('opacity', 1);
                 });
                 posterImg.on('error', function () {
-                    posterImg.attr('src', img).css('opacity', 1);
+                    if (posterImg.attr('src') !== IMG_BG)
+                        posterImg.attr('src', IMG_BG);
+                    posterImg.css('opacity', 1);
                 });
                 posterImg.attr('src', img);
 
@@ -16862,6 +17347,7 @@
                 overflow: hidden;\
             }\
             .lm-ios-full-player--visible { display: block; }\
+            .lm-ios-full-player .selector.focus, .lm-ios-player .selector.focus { outline: 2px solid #f5f5f7; outline-offset: 2px; }\
             body.lm-ios-full-player-open .lm-ios-player { display: none !important; }\
             .lm-ios-full-player__backdrop {\
                 position: absolute;\

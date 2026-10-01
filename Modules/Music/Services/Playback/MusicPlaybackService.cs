@@ -4,12 +4,35 @@ namespace Music;
 
 public static class MusicPlaybackService
 {
-    public static async Task<MusicTrack> ResolveRequestTrackAsync(string id, string provider, string title, string artistName, string albumTitle, int? durationMs, string date, string isrc)
+    public static async Task<MusicTrack> ResolveRequestTrackAsync(string id, string provider, string title, string artistName, string albumId, string albumTitle, int? durationMs, string date, string isrc)
     {
         string normalizedIsrc = MusicIsrc.Normalize(isrc);
-        var track = await MusicCatalogService.GetTrackAsync(id, provider);
+        MusicTrack track = null;
+
+        // Spotify search отдаёт точный track/album id, но без duration/isrc.
+        // Достаём трек из его родного queryAlbum (кэшируется каталогом), вместо
+        // заведомо бесполезного поиска spotify:track:* через MusicBrainz.
+        if (!string.IsNullOrWhiteSpace(id)
+            && id.StartsWith("spotify:track:", StringComparison.OrdinalIgnoreCase)
+            && !durationMs.HasValue
+            && !string.IsNullOrWhiteSpace(albumId)
+            && albumId.StartsWith("spotify:album:", StringComparison.OrdinalIgnoreCase))
+        {
+            var albumTask = MusicCatalogService.GetAlbumAsync(albumId, SpotifySupport.ProviderId);
+            if (await Task.WhenAny(albumTask, Task.Delay(2500)) == albumTask)
+            {
+                var album = await albumTask;
+                track = album?.tracks?.FirstOrDefault(i => string.Equals(i?.id, id, StringComparison.OrdinalIgnoreCase));
+            }
+        }
+        else
+        {
+            track = await MusicCatalogService.GetTrackAsync(id, provider);
+        }
+
         if (track != null)
         {
+            track = CopyTrack(track);
             track.isrc = MusicIsrc.Normalize(track.isrc) ?? normalizedIsrc;
             return track;
         }
@@ -22,10 +45,34 @@ public static class MusicPlaybackService
             id = string.IsNullOrWhiteSpace(id) ? BuildInlineTrackId(title, artistName, albumTitle, durationMs, normalizedIsrc) : id,
             title = title,
             artist_name = artistName,
+            album_id = albumId,
             album_title = albumTitle,
             isrc = normalizedIsrc,
             duration_ms = durationMs,
             date = date
+        };
+    }
+
+    static MusicTrack CopyTrack(MusicTrack track)
+    {
+        return new MusicTrack
+        {
+            id = track.id,
+            title = track.title,
+            artist_id = track.artist_id,
+            artist_name = track.artist_name,
+            artists = track.artists?.ToList() ?? new List<string>(),
+            album_id = track.album_id,
+            album_title = track.album_title,
+            isrc = track.isrc,
+            duration_ms = track.duration_ms,
+            track_number = track.track_number,
+            disc_number = track.disc_number,
+            date = track.date,
+            search_score = track.search_score,
+            images = track.images?.ToList() ?? new List<MusicImage>(),
+            provider_refs = track.provider_refs?.ToList() ?? new List<MusicProviderRef>(),
+            auto_radio = track.auto_radio
         };
     }
 
@@ -132,6 +179,9 @@ public static class MusicPlaybackService
 
         if (!string.IsNullOrWhiteSpace(track?.artist_name))
             url.Add($"artist_name={Uri.EscapeDataString(track.artist_name)}");
+
+        if (!string.IsNullOrWhiteSpace(track?.album_id))
+            url.Add($"album_id={Uri.EscapeDataString(track.album_id)}");
 
         if (!string.IsNullOrWhiteSpace(track?.album_title))
             url.Add($"album_title={Uri.EscapeDataString(track.album_title)}");

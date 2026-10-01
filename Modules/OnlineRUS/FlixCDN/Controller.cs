@@ -51,6 +51,9 @@ public class FlixCDNController : BaseOnlineController
         {
             var result = cache.Value;
             var voices = GetVoices(result);
+            string uidQuery = string.IsNullOrEmpty(requestInfo?.user_uid)
+                ? string.Empty
+                : $"&uid={HttpUtility.UrlEncode(requestInfo.user_uid)}";
 
             if (!result.is_serial)
             {
@@ -61,7 +64,7 @@ public class FlixCDNController : BaseOnlineController
                 {
                     mtpl.Append(
                         voice.title,
-                        $"{host}/lite/flixcdn/stream?kinopoisk_id={kinopoisk_id}&id={result.id}&t={voice.id}",
+                        $"{host}/lite/flixcdn/stream?kinopoisk_id={kinopoisk_id}&id={result.id}&t={voice.id}{uidQuery}",
                         "call",
                         vast: init.vast
                     );
@@ -135,7 +138,7 @@ public class FlixCDNController : BaseOnlineController
                     continue;
 
                 short episodeNumber = (short)episode;
-                string link = $"{host}/lite/flixcdn/stream?kinopoisk_id={kinopoisk_id}&id={result.id}&t={t}&s={s}&e={episodeNumber}";
+                string link = $"{host}/lite/flixcdn/stream?kinopoisk_id={kinopoisk_id}&id={result.id}&t={t}&s={s}&e={episodeNumber}{uidQuery}";
 
                 etpl.Append(
                     $"Серия {episodeNumber}",
@@ -165,9 +168,21 @@ public class FlixCDNController : BaseOnlineController
         if (kinopoisk_id <= 0 || id <= 0 || t <= 0)
             return OnError();
 
-        var cache = await InvokeCacheResult<string>(ipkey($"flixcdn:files:{kinopoisk_id}:{id}:{t}:{s}:{e}"), 10, async result =>
+        var cache = await InvokeCacheResult<string>(ipkey($"flixcdn:files:v2:{kinopoisk_id}:{id}:{t}:{s}:{e}"), 10, async result =>
         {
-            string file = await oninvk.GetPlayerFile(kinopoisk_id, id, t, s, e);
+            if (init.priorityBrowser == "http" || !CoreInit.conf.chromium.enable)
+                return result.Fail("FlixCDN browser access verification is disabled");
+
+            string file = await FlixCdnBrowserResolver.ResolveAsync(
+                init,
+                proxy_data,
+                oninvk.BuildPlayerUrl(kinopoisk_id),
+                id,
+                t,
+                s,
+                e,
+                HttpContext.RequestAborted
+            );
             if (string.IsNullOrWhiteSpace(file))
                 return result.Fail("files", refresh_proxy: true);
 
@@ -235,7 +250,7 @@ public class FlixCDNController : BaseOnlineController
         }
 
         if (seasons.Count == 0 && player?.season > 0 && player.episodes?.Length > 0)
-            seasons[player.season] = player.episodes.Where(e => e > 0).ToArray();
+            seasons[player.season.Value] = player.episodes.Where(e => e > 0).ToArray();
 
         return seasons;
     }

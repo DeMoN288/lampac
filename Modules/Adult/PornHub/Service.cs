@@ -558,9 +558,9 @@ public static class PornHubTo
         if (value.StartsWith("//", StringComparison.Ordinal))
             value = "https:" + value;
 
-        if (!Uri.TryCreate(value, UriKind.Absolute, out var uri) ||
-            (uri.Scheme != Uri.UriSchemeHttps &&
-             uri.Scheme != Uri.UriSchemeHttp))
+        if (!System.Uri.TryCreate(value, System.UriKind.Absolute, out var uri) ||
+            (uri.Scheme != System.Uri.UriSchemeHttps &&
+             uri.Scheme != System.Uri.UriSchemeHttp))
             return null;
 
         // И AND, и проверка validfrom обязательны.
@@ -573,7 +573,7 @@ public static class PornHubTo
 
     bool IsHls(string url)
     {
-        return Uri.TryCreate(url, UriKind.Absolute, out var uri) &&
+        return System.Uri.TryCreate(url, System.UriKind.Absolute, out var uri) &&
             uri.AbsolutePath.EndsWith(
                 ".m3u8", StringComparison.OrdinalIgnoreCase);
     }
@@ -618,7 +618,7 @@ public static class PornHubTo
             return;
 
         bool hls = IsHls(url);
-        var uri = new Uri(url);
+        var uri = new System.Uri(url);
         bool master = hls && uri.AbsolutePath.EndsWith(
             "/master.m3u8", StringComparison.OrdinalIgnoreCase);
 

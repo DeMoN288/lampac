@@ -534,260 +534,260 @@ public static class PornHubTo
     ReadOnlySpan<char> html,
     string video_uri,
     string list_uri)
-{
-    if (html.IsEmpty)
-        return null;
-
-    string source = html.ToString();
-    var qualitys = new Dictionary<string, string>(4);
-    string hlsFallback = null;
-
-    const System.Text.RegularExpressions.RegexOptions options =
-        System.Text.RegularExpressions.RegexOptions.IgnoreCase |
-        System.Text.RegularExpressions.RegexOptions.CultureInvariant;
-
-    string NormalizeUrl(string value)
     {
-        if (string.IsNullOrWhiteSpace(value))
+        if (html.IsEmpty)
             return null;
 
-        value = System.Net.WebUtility.HtmlDecode(value)
-            .Replace("\\/", "/")
-            .Trim();
+        string source = html.ToString();
+        var qualitys = new Dictionary<string, string>(4);
+        string hlsFallback = null;
 
-        if (value.StartsWith("//", StringComparison.Ordinal))
-            value = "https:" + value;
+        const System.Text.RegularExpressions.RegexOptions options =
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase |
+            System.Text.RegularExpressions.RegexOptions.CultureInvariant;
 
-        if (!System.Uri.TryCreate(value, System.UriKind.Absolute, out var uri) ||
-            (uri.Scheme != System.Uri.UriSchemeHttps &&
-             uri.Scheme != System.Uri.UriSchemeHttp))
-            return null;
-
-        // И AND, и проверка validfrom обязательны.
-        if (string.IsNullOrEmpty(value) ||
-            !value.Contains("validfrom", StringComparison.OrdinalIgnoreCase))
-            return null;
-
-        return value;
-    }
-
-    bool IsHls(string url)
-    {
-        return System.Uri.TryCreate(url, System.UriKind.Absolute, out var uri) &&
-            uri.AbsolutePath.EndsWith(
-                ".m3u8", StringComparison.OrdinalIgnoreCase);
-    }
-
-    string GetQuality(System.Text.Json.JsonElement element)
-    {
-        if (element.ValueKind == System.Text.Json.JsonValueKind.Array)
+        string NormalizeUrl(string value)
         {
-            // Массив качеств описывает master, а не отдельный вариант.
-            if (element.GetArrayLength() != 1)
+            if (string.IsNullOrWhiteSpace(value))
                 return null;
 
-            return GetQuality(element[0]);
+            value = System.Net.WebUtility.HtmlDecode(value)
+                .Replace("\\/", "/")
+                .Trim();
+
+            if (value.StartsWith("//", StringComparison.Ordinal))
+                value = "https:" + value;
+
+            if (!System.Uri.TryCreate(value, System.UriKind.Absolute, out var uri) ||
+                (uri.Scheme != System.Uri.UriSchemeHttps &&
+                 uri.Scheme != System.Uri.UriSchemeHttp))
+                return null;
+
+            // И AND, и проверка validfrom обязательны.
+            if (string.IsNullOrEmpty(value) ||
+                !value.Contains("validfrom", StringComparison.OrdinalIgnoreCase))
+                return null;
+
+            return value;
         }
 
-        string value = element.ValueKind switch
+        bool IsHls(string url)
         {
-            System.Text.Json.JsonValueKind.String => element.GetString(),
-            System.Text.Json.JsonValueKind.Number => element.GetRawText(),
-            _ => null
-        };
+            return System.Uri.TryCreate(url, System.UriKind.Absolute, out var uri) &&
+                uri.AbsolutePath.EndsWith(
+                    ".m3u8", StringComparison.OrdinalIgnoreCase);
+        }
 
-        if (string.IsNullOrWhiteSpace(value))
+        string GetQuality(System.Text.Json.JsonElement element)
+        {
+            if (element.ValueKind == System.Text.Json.JsonValueKind.Array)
+            {
+                // Массив качеств описывает master, а не отдельный вариант.
+                if (element.GetArrayLength() != 1)
+                    return null;
+
+                return GetQuality(element[0]);
+            }
+
+            string value = element.ValueKind switch
+            {
+                System.Text.Json.JsonValueKind.String => element.GetString(),
+                System.Text.Json.JsonValueKind.Number => element.GetRawText(),
+                _ => null
+            };
+
+            if (string.IsNullOrWhiteSpace(value))
+                return null;
+
+            value = value.Trim().TrimEnd('p', 'P');
+
+            return value switch
+            {
+                "1080" => "1080p",
+                "720" => "720p",
+                "480" => "480p",
+                "240" => "240p",
+                _ => null
+            };
+        }
+
+        void AddVideo(string rawUrl, string quality)
+        {
+            string url = NormalizeUrl(rawUrl);
+            if (url == null)
+                return;
+
+            bool hls = IsHls(url);
+            var uri = new System.Uri(url);
+            bool master = hls && uri.AbsolutePath.EndsWith(
+                "/master.m3u8", StringComparison.OrdinalIgnoreCase);
+
+            if (hls && (master || quality == null))
+            {
+                if (hlsFallback == null || master)
+                    hlsFallback = url;
+
+                // Нельзя выдать master за четыре отдельных качества.
+                return;
+            }
+
+            if (quality == null)
+                return;
+
+            if (!qualitys.TryGetValue(quality, out string existing) ||
+                (hls && !IsHls(existing)))
+                qualitys[quality] = url;
+        }
+
+        void ReadDefinitions(System.Text.Json.JsonElement element)
+        {
+            if (element.ValueKind == System.Text.Json.JsonValueKind.Array)
+            {
+                foreach (var item in element.EnumerateArray())
+                    ReadDefinitions(item);
+
+                return;
+            }
+
+            if (element.ValueKind != System.Text.Json.JsonValueKind.Object)
+                return;
+
+            if (element.TryGetProperty("videoUrl", out var videoUrl) &&
+                videoUrl.ValueKind == System.Text.Json.JsonValueKind.String)
+            {
+                string quality = element.TryGetProperty("quality", out var q)
+                    ? GetQuality(q)
+                    : null;
+
+                AddVideo(videoUrl.GetString(), quality);
+            }
+
+            foreach (var property in element.EnumerateObject())
+            {
+                if (property.Value.ValueKind == System.Text.Json.JsonValueKind.Array ||
+                    property.Value.ValueKind == System.Text.Json.JsonValueKind.Object)
+                    ReadDefinitions(property.Value);
+            }
+        }
+
+        // Извлекаем JSON-массив, учитывая вложенность и экранированные строки.
+        foreach (System.Text.RegularExpressions.Match match in
+            System.Text.RegularExpressions.Regex.Matches(
+                source,
+                @"(?:[""']?mediaDefinitions[""']?)\s*[:=]\s*\[",
+                options))
+        {
+            int start = match.Index + match.Length - 1;
+            int depth = 0;
+            bool inString = false;
+            bool escaped = false;
+
+            for (int i = start; i < source.Length; i++)
+            {
+                char c = source[i];
+
+                if (inString)
+                {
+                    if (escaped)
+                        escaped = false;
+                    else if (c == '\\')
+                        escaped = true;
+                    else if (c == '"')
+                        inString = false;
+
+                    continue;
+                }
+
+                if (c == '"')
+                    inString = true;
+                else if (c == '[')
+                    depth++;
+                else if (c == ']' && --depth == 0)
+                {
+                    try
+                    {
+                        using var document = System.Text.Json.JsonDocument.Parse(
+                            source.Substring(start, i - start + 1),
+                            new System.Text.Json.JsonDocumentOptions
+                            {
+                                AllowTrailingCommas = true,
+                                CommentHandling =
+                                    System.Text.Json.JsonCommentHandling.Skip
+                            });
+
+                        ReadDefinitions(document.RootElement);
+                    }
+                    catch (System.Text.Json.JsonException)
+                    {
+                        // Повреждённый блок не мешает обработке остальных ссылок.
+                    }
+
+                    break;
+                }
+            }
+        }
+
+        // Поддержка отдельных JSON-объектов; порядок полей не важен.
+        foreach (System.Text.RegularExpressions.Match match in
+            System.Text.RegularExpressions.Regex.Matches(
+                source,
+                @"\{(?:[^{}""]|""(?:\\.|[^""\\])*"")*\}",
+                options))
+        {
+            if (!match.Value.Contains("videoUrl", StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            try
+            {
+                using var document =
+                    System.Text.Json.JsonDocument.Parse(match.Value);
+
+                ReadDefinitions(document.RootElement);
+            }
+            catch (System.Text.Json.JsonException)
+            {
+                // Далее остаётся fallback для прямых HLS-ссылок.
+            }
+        }
+
+        // Прямые videoUrl и строковые ссылки на master.m3u8.
+        foreach (System.Text.RegularExpressions.Match match in
+            System.Text.RegularExpressions.Regex.Matches(
+                source,
+                @"""(?:\\.|[^""\\])*""",
+                options))
+        {
+            if (!match.Value.Contains(".m3u8", StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            try
+            {
+                string url =
+                    System.Text.Json.JsonSerializer.Deserialize<string>(match.Value);
+
+                if (NormalizeUrl(url) is string normalized && IsHls(normalized))
+                    AddVideo(normalized, null);
+            }
+            catch (System.Text.Json.JsonException)
+            {
+                // Невалидную строку пропускаем.
+            }
+        }
+
+        // Реальные варианты master доступны только после загрузки плейлиста.
+        // Без сетевого I/O сохраняем master как HLS с автоматическим качеством.
+        if (qualitys.Count == 0 && hlsFallback != null)
+            qualitys["auto"] = hlsFallback;
+
+        if (qualitys.Count == 0)
             return null;
 
-        value = value.Trim().TrimEnd('p', 'P');
-
-        return value switch
+        return new StreamItem
         {
-            "1080" => "1080p",
-            "720" => "720p",
-            "480" => "480p",
-            "240" => "240p",
-            _ => null
+            qualitys = qualitys,
+            recomends = Playlist(video_uri, list_uri, html, related: true)
         };
     }
-
-    void AddVideo(string rawUrl, string quality)
-    {
-        string url = NormalizeUrl(rawUrl);
-        if (url == null)
-            return;
-
-        bool hls = IsHls(url);
-        var uri = new System.Uri(url);
-        bool master = hls && uri.AbsolutePath.EndsWith(
-            "/master.m3u8", StringComparison.OrdinalIgnoreCase);
-
-        if (hls && (master || quality == null))
-        {
-            if (hlsFallback == null || master)
-                hlsFallback = url;
-
-            // Нельзя выдать master за четыре отдельных качества.
-            return;
-        }
-
-        if (quality == null)
-            return;
-
-        if (!qualitys.TryGetValue(quality, out string existing) ||
-            (hls && !IsHls(existing)))
-            qualitys[quality] = url;
-    }
-
-    void ReadDefinitions(System.Text.Json.JsonElement element)
-    {
-        if (element.ValueKind == System.Text.Json.JsonValueKind.Array)
-        {
-            foreach (var item in element.EnumerateArray())
-                ReadDefinitions(item);
-
-            return;
-        }
-
-        if (element.ValueKind != System.Text.Json.JsonValueKind.Object)
-            return;
-
-        if (element.TryGetProperty("videoUrl", out var videoUrl) &&
-            videoUrl.ValueKind == System.Text.Json.JsonValueKind.String)
-        {
-            string quality = element.TryGetProperty("quality", out var q)
-                ? GetQuality(q)
-                : null;
-
-            AddVideo(videoUrl.GetString(), quality);
-        }
-
-        foreach (var property in element.EnumerateObject())
-        {
-            if (property.Value.ValueKind == System.Text.Json.JsonValueKind.Array ||
-                property.Value.ValueKind == System.Text.Json.JsonValueKind.Object)
-                ReadDefinitions(property.Value);
-        }
-    }
-
-    // Извлекаем JSON-массив, учитывая вложенность и экранированные строки.
-    foreach (System.Text.RegularExpressions.Match match in
-        System.Text.RegularExpressions.Regex.Matches(
-            source,
-            @"(?:[""']?mediaDefinitions[""']?)\s*[:=]\s*\[",
-            options))
-    {
-        int start = match.Index + match.Length - 1;
-        int depth = 0;
-        bool inString = false;
-        bool escaped = false;
-
-        for (int i = start; i < source.Length; i++)
-        {
-            char c = source[i];
-
-            if (inString)
-            {
-                if (escaped)
-                    escaped = false;
-                else if (c == '\\')
-                    escaped = true;
-                else if (c == '"')
-                    inString = false;
-
-                continue;
-            }
-
-            if (c == '"')
-                inString = true;
-            else if (c == '[')
-                depth++;
-            else if (c == ']' && --depth == 0)
-            {
-                try
-                {
-                    using var document = System.Text.Json.JsonDocument.Parse(
-                        source.Substring(start, i - start + 1),
-                        new System.Text.Json.JsonDocumentOptions
-                        {
-                            AllowTrailingCommas = true,
-                            CommentHandling =
-                                System.Text.Json.JsonCommentHandling.Skip
-                        });
-
-                    ReadDefinitions(document.RootElement);
-                }
-                catch (System.Text.Json.JsonException)
-                {
-                    // Повреждённый блок не мешает обработке остальных ссылок.
-                }
-
-                break;
-            }
-        }
-    }
-
-    // Поддержка отдельных JSON-объектов; порядок полей не важен.
-    foreach (System.Text.RegularExpressions.Match match in
-        System.Text.RegularExpressions.Regex.Matches(
-            source,
-            @"\{(?:[^{}""]|""(?:\\.|[^""\\])*"")*\}",
-            options))
-    {
-        if (!match.Value.Contains("videoUrl", StringComparison.OrdinalIgnoreCase))
-            continue;
-
-        try
-        {
-            using var document =
-                System.Text.Json.JsonDocument.Parse(match.Value);
-
-            ReadDefinitions(document.RootElement);
-        }
-        catch (System.Text.Json.JsonException)
-        {
-            // Далее остаётся fallback для прямых HLS-ссылок.
-        }
-    }
-
-    // Прямые videoUrl и строковые ссылки на master.m3u8.
-    foreach (System.Text.RegularExpressions.Match match in
-        System.Text.RegularExpressions.Regex.Matches(
-            source,
-            @"""(?:\\.|[^""\\])*""",
-            options))
-    {
-        if (!match.Value.Contains(".m3u8", StringComparison.OrdinalIgnoreCase))
-            continue;
-
-        try
-        {
-            string url =
-                System.Text.Json.JsonSerializer.Deserialize<string>(match.Value);
-
-            if (NormalizeUrl(url) is string normalized && IsHls(normalized))
-                AddVideo(normalized, null);
-        }
-        catch (System.Text.Json.JsonException)
-        {
-            // Невалидную строку пропускаем.
-        }
-    }
-
-    // Реальные варианты master доступны только после загрузки плейлиста.
-    // Без сетевого I/O сохраняем master как HLS с автоматическим качеством.
-    if (qualitys.Count == 0 && hlsFallback != null)
-        qualitys["auto"] = hlsFallback;
-
-    if (qualitys.Count == 0)
-        return null;
-
-    return new StreamItem
-    {
-        qualitys = qualitys,
-        recomends = Playlist(video_uri, list_uri, html, related: true)
-    };
-}
     #endregion
 
     #region Pages

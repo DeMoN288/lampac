@@ -331,65 +331,108 @@ public static class XvideosTo
         return $"{host}/{url}";
     }
 
-    public static StreamItem StreamLinks(ReadOnlySpan<char> html, string route, string uri_star, Func<string, Task<string>> onm3u = null)
+    public static StreamItem StreamLinks(
+        ReadOnlySpan<char> html,
+        string route,
+        string uri_star,
+        Func<string, Task<string>> onm3u = null)
     {
         if (html.IsEmpty)
             return null;
 
-        string stream_link = Rx.Match(html, "html5player\\.setVideoHLS\\('([^']+)'\\);");
-        if (string.IsNullOrWhiteSpace(stream_link))
+        var qualitys = new Dictionary<string, string>();
+
+        string hls = Rx.Match(html, @"html5player\.setVideoHLS\('([^']+)'\);");
+        if (!string.IsNullOrWhiteSpace(hls))
+            qualitys["auto"] = hls;
+
+        string mp4High = Rx.Match(html, @"html5player\.setVideoUrlHigh\('([^']+)'\);");
+        if (!string.IsNullOrWhiteSpace(mp4High))
+            qualitys["720p"] = mp4High;
+
+        string mp4Low = Rx.Match(html, @"html5player\.setVideoUrlLow\('([^']+)'\);");
+        if (!string.IsNullOrWhiteSpace(mp4Low))
+            qualitys["360p"] = mp4Low;
+
+        if (qualitys.Count == 0)
             return null;
 
         #region getRelated
-        List<PlaylistItem> getRelated(ReadOnlySpan<char> html)
+        List<PlaylistItem> getRelated(ReadOnlySpan<char> source)
         {
-            string json = Rx.Match(html, @"video_related\s*=\s*(\[[\s\S]*?\])\s*;", options: RegexOptions.Singleline | RegexOptions.CultureInvariant);
-            if (string.IsNullOrWhiteSpace(json) || !json.StartsWith("[") || !json.EndsWith("]"))
-                return new List<PlaylistItem>();
-
             var related = new List<PlaylistItem>(40);
+
+            string json = Rx.Match(
+                source,
+                @"video_related\s*=\s*(\[[\s\S]*?\])\s*;",
+                options: RegexOptions.Singleline | RegexOptions.CultureInvariant);
+
+            if (string.IsNullOrWhiteSpace(json) ||
+                !json.StartsWith("[", StringComparison.Ordinal) ||
+                !json.EndsWith("]", StringComparison.Ordinal))
+            {
+                return related;
+            }
 
             try
             {
-                foreach (var r in JsonSerializer.Deserialize<List<Related>>(json, new JsonSerializerOptions
+                var items = JsonSerializer.Deserialize<List<Related>>(
+                    json,
+                    new JsonSerializerOptions
+                    {
+                        AllowTrailingCommas = true
+                    });
+
+                if (items == null)
+                    return related;
+
+                foreach (var r in items)
                 {
-                    AllowTrailingCommas = true
-                }))
-                {
-                    if (string.IsNullOrEmpty(r.tf) || string.IsNullOrEmpty(r.u))
+                    if (r == null ||
+                        string.IsNullOrEmpty(r.tf) ||
+                        string.IsNullOrEmpty(r.u))
+                    {
+                        continue;
+                    }
+
+                    string videoUri = r.u.StartsWith("/", StringComparison.Ordinal)
+                        ? r.u.Substring(1)
+                        : r.u;
+
+                    if (string.IsNullOrEmpty(videoUri))
                         continue;
 
                     string p = r.p?.ToString();
                     string pn = r.pn?.ToString();
                     ModelItem model = null;
 
-                    if (!string.IsNullOrEmpty(p) && !string.IsNullOrEmpty(pn))
+                    if (!string.IsNullOrEmpty(p) &&
+                        !string.IsNullOrEmpty(pn) &&
+                        !p.StartsWith("false", StringComparison.OrdinalIgnoreCase) &&
+                        !pn.StartsWith("false", StringComparison.OrdinalIgnoreCase))
                     {
-                        if (!p.StartsWith("false", StringComparison.OrdinalIgnoreCase) &&
-                            !pn.StartsWith("false", StringComparison.OrdinalIgnoreCase))
+                        model = new ModelItem
                         {
-                            model = new ModelItem()
-                            {
-                                name = pn,
-                                uri = $"{uri_star}?uri=" + (r?.ch == true ? "channels/" : "pornstars/") + r.p,
-                            };
-                        }
+                            name = pn,
+                            uri = $"{uri_star}?uri=" +
+                                  (r.ch == true ? "channels/" : "pornstars/") + p
+                        };
                     }
 
-                    related.Add(new PlaylistItem()
+                    related.Add(new PlaylistItem
                     {
                         name = r.tf,
-                        video = $"{route}?uri={r.u.Remove(0, 1)}",
+                        video = $"{route}?uri={videoUri}",
                         picture = r.i,
                         preview = r.ipu,
                         time = r.d,
                         json = true,
                         related = true,
                         model = model,
-                        bookmark = new Bookmark()
+                        bookmark = new Bookmark
                         {
                             site = "xds",
-                            href = r.u.Remove(0, 1),
+                            href = videoUri,
                             image = r.i
                         }
                     });
@@ -397,54 +440,22 @@ public static class XvideosTo
             }
             catch (Exception ex)
             {
-                Serilog.Log.Error(ex, "{Class} {CatchId}", "XvideosTo", "id_wqrdlrn9");
+                Serilog.Log.Error(
+                    ex,
+                    "{Class} {CatchId}",
+                    "XvideosTo",
+                    "id_wqrdlrn9");
             }
 
             return related;
         }
-
         #endregion
 
-        return new StreamItem()
+        return new StreamItem
         {
-            qualitys = new Dictionary<string, string>()
-            {
-                ["auto"] = stream_link
-            },
+            qualitys = qualitys,
             recomends = getRelated(html)
         };
-
-        //string m3u8 = onm3u == null ? null : await onm3u.Invoke(stream_link);
-        //if (m3u8 == null)
-        //{
-        //    return new StreamItem()
-        //    {
-        //        qualitys = new Dictionary<string, string>()
-        //        {
-        //            ["auto"] = stream_link
-        //        },
-        //        recomends = getRelated()
-        //    };
-        //}
-
-        //var stream_links = new Dictionary<int, string>();
-
-        //foreach (string line in m3u8.Split('\n'))
-        //{
-        //    if (string.IsNullOrWhiteSpace(line) || !line.StartsWith("hls-"))
-        //        continue;
-
-        //    string _q = new Regex("hls-([0-9]+)p").Match(line).Groups[1].Value;
-
-        //    if (int.TryParse(_q, out int q) && q > 0)
-        //        stream_links.TryAdd(q, $"{Regex.Replace(stream_link, "/hls.m3u8.*", "")}/{line}");
-        //}
-
-        //return new StreamItem()
-        //{
-        //    qualitys = stream_links.OrderByDescending(i => i.Key).ToDictionary(k => $"{k.Key}p", v => v.Value),
-        //    recomends = getRelated()
-        //};
     }
     #endregion
 }

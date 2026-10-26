@@ -43,7 +43,7 @@ public class ModInit : IModuleLoaded, IModuleSisi
     void updateConf()
     {
         // https://www.xvideos.com
-        conf = ModuleInvoke.Init("Xvideos", new SisiSettings("Xvideos", "https://www.xv-ru.com")
+        conf = ModuleInvoke.Init("Xvideos", new SisiSettings("Xvideos", "https://www.xvideos.com")
         {
             httpversion = 2,
             displayindex = 12,

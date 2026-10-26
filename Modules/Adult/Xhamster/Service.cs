@@ -424,17 +424,30 @@ public static class XhamsterTo
         if (html.IsEmpty)
             return null;
 
-        string stream_link = Rx.Match(html, "rel=\"preload\" href=\"([^\"]+)\"");
-        if (stream_link == null || !stream_link.Contains(".m3u"))
+        string page = html.ToString().Replace("\\", "");
+
+        string stream_link = Rx.Match(
+            page.AsSpan(),
+            @"<link\b[^>]*\brel\s*=\s*[""']preload[""'][^>]*\bhref\s*=\s*[""']([^""']+\.m3u8[^""']*)[""']");
+
+        if (string.IsNullOrEmpty(stream_link))
+        {
+            stream_link = Rx.Match(
+                page.AsSpan(),
+                @"((?:https?://|/)[^""'<>\s]*\.m3u8[^""'<>\s]*)");
+        }
+
+        if (string.IsNullOrEmpty(stream_link))
             return null;
+
+        if (stream_link.StartsWith("/"))
+            stream_link = host + stream_link;
 
         return new StreamItem()
         {
             qualitys = new Dictionary<string, string>()
             {
-                ["auto"] = stream_link.StartsWith("/")
-                    ? host + stream_link.Replace("\\", "")
-                    : stream_link.Replace("\\", "")
+                ["auto"] = stream_link
             },
             recomends = Playlist(route, html)
         };
